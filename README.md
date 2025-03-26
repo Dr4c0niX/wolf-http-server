@@ -1,1 +1,1 @@
-# Wolf Game Serveur TCP
+# Wolf Game Serveur HTTP
