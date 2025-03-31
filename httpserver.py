@@ -1,213 +1,298 @@
+#wolf-http-server/httpserver.py
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import psycopg2
-import socket
-import threading
-import os
+from psycopg2.extras import RealDictCursor
 
-# Connexion à la base de données
-conn = psycopg2.connect(
-    dbname="wolf_game",
-    user="wolf_admin",
-    password="motdepasse_secure",
-    host="db",
-    port="5432"
-)
-cursor = conn.cursor()
+# Connexion à la base de données - création d'une fonction pour obtenir une nouvelle connexion
+def get_db_connection():
+    return psycopg2.connect(
+        dbname="wolf_game",
+        user="wolf_admin",
+        password="motdepasse_secure",
+        host="db",
+        port="5432"
+    )
 
-# Stockage en mémoire des parties détaillées
-party_details_cache = {}
-
-# Configuration du serveur TCP pour les notifications
-TCP_HOST = '0.0.0.0'  # Écouter sur toutes les interfaces
-TCP_PORT = int(os.environ.get('HTTP_SERVER_PORT', 9000))  # Port d'écoute TCP pour les notifications
-
-def start_tcp_server():
-    """
-    Démarre un serveur TCP pour recevoir les notifications de l'admin-engine
-    """
-    print(f"Démarrage du serveur TCP sur {TCP_HOST}:{TCP_PORT}")
-    
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_socket:
-        tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tcp_socket.bind((TCP_HOST, TCP_PORT))
-        tcp_socket.listen(5)
-        
-        while True:
-            # Accepter les connexions
-            client_socket, addr = tcp_socket.accept()
-            print(f"Connexion TCP acceptée de {addr}")
-            
-            # Traiter la connexion dans un thread séparé
-            client_thread = threading.Thread(target=handle_tcp_client, args=(client_socket,))
-            client_thread.daemon = True
-            client_thread.start()
-
-def handle_tcp_client(client_socket):
-    """
-    Traite les messages reçus d'un client TCP
-    """
-    try:
-        # Recevoir les données
-        data = client_socket.recv(4096).decode('utf-8')
-        if data:
-            # Traiter le message JSON
-            message = json.loads(data)
-            action = message.get("action")
-            
-            if action == "new_party":
-                party_data = message.get("data", {})
-                # Mettre à jour le cache des détails de partie
-                party_id = party_data.get("id_party")
-                if party_id:
-                    party_details_cache[str(party_id)] = party_data
-                    print(f"Nouvelle partie mise en cache: {party_data}")
-                    # Répondre au client
-                    client_socket.sendall(json.dumps({"status": "OK", "message": "Party details cached"}).encode('utf-8'))
-                else:
-                    client_socket.sendall(json.dumps({"status": "ERROR", "message": "Invalid party data"}).encode('utf-8'))
-            else:
-                client_socket.sendall(json.dumps({"status": "ERROR", "message": "Unknown action"}).encode('utf-8'))
-    except Exception as e:
-        print(f"Erreur lors du traitement d'une connexion TCP: {e}")
-    finally:
-        client_socket.close()
+# Connexion initiale
+conn = get_db_connection()
+cursor = conn.cursor(cursor_factory=RealDictCursor)
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        global conn, cursor
+        
+        # Vérifier si la connexion est active et fonctionnelle
+        try:
+            # Essayer une requête simple pour vérifier la connexion
+            cursor.execute("SELECT 1")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.InternalError, 
+                psycopg2.errors.InFailedSqlTransaction) as e:
+            # Si erreur de transaction ou connexion perdue, recréer la connexion
+            print(f"Réinitialisation de la connexion à la base de données: {e}")
+            try:
+                conn.rollback()  # Tentative de rollback
+            except:
+                pass  # Ignorer si pas de transaction active
+            
+            try:
+                cursor.close()
+                conn.close()
+            except:
+                pass  # Ignorer si déjà fermées
+                
+            conn = get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+
         if self.path == '/list_parties':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
-            # Récupérer les parties depuis la base de données
-            cursor.execute("SELECT id_party, title_party FROM parties WHERE is_started = FALSE AND is_finished = FALSE")
-            parties = cursor.fetchall()
-            parties_data = {
-                "id_parties": [party[0] for party in parties],
-                "parties_details": party_details_cache  # Ajouter les détails en cache
-            }
+            try:
+                # Récupérer les parties depuis la base de données
+                cursor.execute("SELECT id_party, title_party FROM parties WHERE is_started = FALSE AND is_finished = FALSE")
+                parties = cursor.fetchall()
+                parties_data = {
+                    "id_parties": [party['id_party'] for party in parties],
+                    "parties_info": {str(party['id_party']): {"title_party": party['title_party']} for party in parties}
+                }
 
-            self.wfile.write(json.dumps(parties_data).encode('utf-8'))
+                self.wfile.write(json.dumps(parties_data).encode('utf-8'))
+                conn.commit()  # Commit après une requête réussie
+            except Exception as e:
+                conn.rollback()  # Rollback en cas d'erreur
+                print(f"Erreur lors de la récupération des parties: {e}")
+                self.send_error(500, f"Erreur serveur: {str(e)}")
+        
         elif self.path.startswith('/party_details/'):
             party_id = self.path.split('/')[-1]
+            try:
+                party_id = int(party_id)
+                try:
+                    cursor.execute("""
+                        SELECT p.id_party, p.title_party, p.grid_rows, p.grid_cols, p.obstacles_count,
+                               p.max_players, p.max_turns, p.turn_duration,
+                               COUNT(CASE WHEN r.role_name = 'villager' THEN 1 END) as villagers_count,
+                               COUNT(CASE WHEN r.role_name = 'werewolf' THEN 1 END) as werewolves_count,
+                               COUNT(pip.id_player) as current_players
+                        FROM parties p
+                        LEFT JOIN players_in_parties pip ON p.id_party = pip.id_party
+                        LEFT JOIN roles r ON pip.id_role = r.id_role
+                        WHERE p.id_party = %s
+                        GROUP BY p.id_party
+                    """, (party_id,))
+                    party = cursor.fetchone()
+                    
+                    if party:
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.end_headers()
+                        self.wfile.write(json.dumps(dict(party)).encode('utf-8'))
+                    else:
+                        self.send_response(404)
+                        self.send_header('Content-type', 'application/json')
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "Partie non trouvée"}).encode('utf-8'))
+                    
+                    conn.commit()  # Commit après une requête réussie
+                except Exception as e:
+                    conn.rollback()  # Rollback en cas d'erreur
+                    print(f"Erreur lors de la récupération des détails de la partie: {e}")
+                    self.send_error(500, f"Erreur serveur: {str(e)}")
+            except ValueError:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "ID de partie invalide"}).encode('utf-8'))
+
+        elif self.path == '/all_parties_details':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             
-            # Vérifier si les détails sont en cache
-            if party_id in party_details_cache:
-                self.wfile.write(json.dumps(party_details_cache[party_id]).encode('utf-8'))
-            else:
-                # Récupérer les détails de la partie depuis la base de données
-                cursor.execute("SELECT id_party, title_party, grid_size, max_players, max_turns, turn_duration FROM parties WHERE id_party = %s", (party_id,))
-                party = cursor.fetchone()
-                if party:
-                    party_info = {
-                        "id_party": party[0],
-                        "title": party[1],
-                        "grid_size": party[2],
-                        "max_players": party[3],
-                        "max_turns": party[4],
-                        "turn_duration": party[5],
-                        "current_players": 0,
-                        "villagers_count": 0,
-                        "werewolves_count": 0
-                    }
-                    # Mettre en cache pour les futures demandes
-                    party_details_cache[party_id] = party_info
-                    self.wfile.write(json.dumps(party_info).encode('utf-8'))
-                else:
-                    self.wfile.write(json.dumps({"error": "Party not found"}).encode('utf-8'))
+            try:
+                cursor.execute("""
+                    SELECT p.id_party, p.title_party, p.grid_rows, p.grid_cols, p.obstacles_count,
+                           p.max_players, p.max_turns, p.turn_duration,
+                           COUNT(CASE WHEN r.role_name = 'villager' THEN 1 END) as villagers_count,
+                           COUNT(CASE WHEN r.role_name = 'werewolf' THEN 1 END) as werewolves_count,
+                           COUNT(pip.id_player) as current_players
+                    FROM parties p
+                    LEFT JOIN players_in_parties pip ON p.id_party = pip.id_party
+                    LEFT JOIN roles r ON pip.id_role = r.id_role
+                    WHERE p.is_started = FALSE AND p.is_finished = FALSE
+                    GROUP BY p.id_party
+                """)
+                parties = cursor.fetchall()
+                parties_dict = {str(party['id_party']): dict(party) for party in parties}
+                
+                self.wfile.write(json.dumps(parties_dict).encode('utf-8'))
+                conn.commit()  # Commit après une requête réussie
+            except Exception as e:
+                conn.rollback()  # Rollback en cas d'erreur
+                print(f"Erreur lors de la récupération de toutes les parties: {e}")
+                self.send_error(500, f"Erreur serveur: {str(e)}")
         else:
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
 
     def do_POST(self):
+        global conn, cursor
+        
+        # Vérifier si la connexion est active et fonctionnelle
+        try:
+            cursor.execute("SELECT 1")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.InternalError, 
+                psycopg2.errors.InFailedSqlTransaction) as e:
+            print(f"Réinitialisation de la connexion à la base de données: {e}")
+            try:
+                conn.rollback()
+            except:
+                pass
+                
+            try:
+                cursor.close()
+                conn.close()
+            except:
+                pass
+                
+            conn = get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
-        data = json.loads(post_data)
+        
+        try:
+            data = json.loads(post_data)
+        except json.JSONDecodeError as e:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"Format JSON invalide: {str(e)}"}).encode('utf-8'))
+            return
 
         if self.path == '/subscribe':
-            # Code existant pour s'inscrire à une partie...
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
-            # Logique pour s'inscrire à une partie
-            player = data["player"]
-            id_party = data["id_party"]
+            try:
+                # Logique pour s'inscrire à une partie
+                player = data["player"]
+                id_party = data["id_party"]
+                role_preference = data.get("role_preference", "villageois")
 
-            # Vérifier si le joueur existe, sinon le créer
-            cursor.execute("SELECT id_player FROM players WHERE pseudo = %s", (player,))
-            result = cursor.fetchone()
-            if result is None:
-                cursor.execute("INSERT INTO players (pseudo) VALUES (%s) RETURNING id_player", (player,))
-                id_player = cursor.fetchone()[0]
-            else:
-                id_player = result[0]
+                # Vérifier si le joueur existe, sinon le créer
+                cursor.execute("SELECT id_player FROM players WHERE pseudo = %s", (player,))
+                result = cursor.fetchone()
+                if result is None:
+                    cursor.execute("INSERT INTO players (pseudo) VALUES (%s) RETURNING id_player", (player,))
+                    id_player = cursor.fetchone()['id_player']
+                else:
+                    id_player = result['id_player']
 
-            # Inscrire le joueur à la partie
-            cursor.execute("INSERT INTO players_in_parties (id_party, id_player, id_role) VALUES (%s, %s, (SELECT id_role FROM roles WHERE role_name = 'villager' LIMIT 1))", (id_party, id_player))
-            conn.commit()
+                # Déterminer le rôle (pour simplifier, utilisons le rôle préféré)
+                role_name = 'villager' if role_preference == 'villageois' else 'werewolf'
+                cursor.execute("SELECT id_role FROM roles WHERE role_name = %s", (role_name,))
+                id_role = cursor.fetchone()['id_role']
 
-            response = {
-                "status": "OK",
-                "response": {
-                    "role": "villager",
+                # Inscrire le joueur à la partie
+                cursor.execute("INSERT INTO players_in_parties (id_party, id_player, id_role) VALUES (%s, %s, %s)", 
+                              (id_party, id_player, id_role))
+                
+                # Commit après toutes les opérations réussies
+                conn.commit()
+
+                response = {
+                    "status": "OK",
+                    "response": {
+                        "role": role_preference,
+                        "id_player": id_player
+                    }
+                }
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+            except Exception as e:
+                conn.rollback()  # Rollback en cas d'erreur
+                print(f"Erreur lors de l'inscription: {e}")
+                error_response = {
+                    "status": "ERROR",
+                    "error": str(e)
+                }
+                self.wfile.write(json.dumps(error_response).encode('utf-8'))
+            
+        elif self.path == '/create_solo_game':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            try:
+                player_name = data["player_name"]
+                role_preference = data.get("role_preference", "villageois")
+                
+                # Créer une nouvelle partie
+                cursor.execute("""
+                    INSERT INTO parties (title_party, grid_rows, grid_cols, obstacles_count, max_players, max_turns, turn_duration)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id_party
+                """, (f"Partie solo de {player_name}", 10, 10, 3, 8, 30, 60))
+                
+                id_party = cursor.fetchone()['id_party']
+                
+                # Vérifier si le joueur existe, sinon le créer
+                cursor.execute("SELECT id_player FROM players WHERE pseudo = %s", (player_name,))
+                result = cursor.fetchone()
+                if result is None:
+                    cursor.execute("INSERT INTO players (pseudo) VALUES (%s) RETURNING id_player", (player_name,))
+                    id_player = cursor.fetchone()['id_player']
+                else:
+                    id_player = result['id_player']
+                    
+                # Déterminer le rôle (pour simplifier, utilisons le rôle préféré)
+                role_name = 'villager' if role_preference == 'villageois' else 'werewolf'
+                cursor.execute("SELECT id_role FROM roles WHERE role_name = %s", (role_name,))
+                id_role = cursor.fetchone()['id_role']
+                
+                # Inscrire le joueur à la partie
+                cursor.execute("INSERT INTO players_in_parties (id_party, id_player, id_role) VALUES (%s, %s, %s)",
+                              (id_party, id_player, id_role))
+                
+                # Commit après toutes les opérations réussies
+                conn.commit()
+                
+                response = {
+                    "status": "OK",
+                    "id_party": id_party,
                     "id_player": id_player
                 }
-            }
-            self.wfile.write(json.dumps(response).encode('utf-8'))
-        elif self.path == '/create_solo_game':
-            # Ajout de l'endpoint pour créer une partie solo
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            player_name = data.get("player_name")
-            role_preference = data.get("role_preference")
-            
-            # Vérifier si le joueur existe, sinon le créer
-            cursor.execute("SELECT id_player FROM players WHERE pseudo = %s", (player_name,))
-            result = cursor.fetchone()
-            if result is None:
-                cursor.execute("INSERT INTO players (pseudo) VALUES (%s) RETURNING id_player", (player_name,))
-                id_player = cursor.fetchone()[0]
-            else:
-                id_player = result[0]
-            
-            # Créer une nouvelle partie
-            cursor.execute("INSERT INTO parties (title_party, is_started, is_finished) VALUES ('Solo Game', FALSE, FALSE) RETURNING id_party")
-            id_party = cursor.fetchone()[0]
-            
-            # Inscrire le joueur à la partie
-            cursor.execute("INSERT INTO players_in_parties (id_party, id_player, id_role) VALUES (%s, %s, (SELECT id_role FROM roles WHERE role_name = %s LIMIT 1))", (id_party, id_player, role_preference))
-            conn.commit()
-            
-            response = {
-                "status": "OK",
-                "id_party": id_party,
-                "id_player": id_player
-            }
-            self.wfile.write(json.dumps(response).encode('utf-8'))
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+            except Exception as e:
+                conn.rollback()  # Rollback en cas d'erreur
+                print(f"Erreur lors de la création d'une partie solo: {e}")
+                error_response = {
+                    "status": "ERROR",
+                    "error": str(e)
+                }
+                self.wfile.write(json.dumps(error_response).encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
 
 def run(server_class=HTTPServer, handler_class=SimpleHTTPRequestHandler, port=8080):
-    # Démarrer le serveur TCP dans un thread séparé
-    tcp_thread = threading.Thread(target=start_tcp_server)
-    tcp_thread.daemon = True
-    tcp_thread.start()
-    
-    # Démarrer le serveur HTTP
-    server_address = ('', port)
+    server_address = ('0.0.0.0', port)  # Accepte les connexions de toutes les interfaces
     httpd = server_class(server_address, handler_class)
-    print(f"Démarrage du serveur HTTP sur le port {port}")
+    print(f"Starting httpd server on port {port}")
     httpd.serve_forever()
-
+    
 if __name__ == "__main__":
     run()
